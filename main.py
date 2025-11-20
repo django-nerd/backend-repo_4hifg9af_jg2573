@@ -388,6 +388,29 @@ def _zip_dir(base_dir: str, out_zip_path: str, arc_base: Optional[str] = None):
                 except Exception:
                     pass
 
+def _zip_dir_to_bytes(base_dir: str, arc_base: Optional[str] = None) -> bytes:
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for dirpath, dirnames, filenames in os.walk(base_dir):
+            dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIR_NAMES and not d.startswith('.')]
+            for fname in filenames:
+                if fname == ".DS_Store":
+                    continue
+                fpath = os.path.join(dirpath, fname)
+                if "/logs/" in fpath:
+                    continue
+                if arc_base:
+                    arcname = os.path.join(arc_base, os.path.relpath(fpath, base_dir))
+                else:
+                    arcname = os.path.relpath(fpath, base_dir)
+                try:
+                    zf.write(fpath, arcname)
+                except Exception:
+                    pass
+    buf.seek(0)
+    return buf.read()
+
 # Export backend as zip
 @app.get("/export/backend.zip")
 async def export_backend():
@@ -398,18 +421,19 @@ async def export_backend():
     _zip_dir(backend_dir, tmp.name)
     return FileResponse(tmp.name, media_type="application/zip", filename="backend.zip")
 
-# Export frontend as zip
+# Export frontend as zip (in-memory to avoid any temp-file edge cases)
 @app.get("/export/frontend.zip")
 async def export_frontend():
-    import tempfile
     root = os.path.abspath(os.path.join(os.getcwd(), ".."))
     frontend_dir = os.path.join(root, "frontend")
     if not os.path.isdir(frontend_dir):
         raise HTTPException(status_code=404, detail="frontend directory not found")
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=",frontend.zip")
-    tmp.close()
-    _zip_dir(frontend_dir, tmp.name)
-    return FileResponse(tmp.name, media_type="application/zip", filename="frontend.zip")
+    try:
+        zip_bytes = _zip_dir_to_bytes(frontend_dir)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"zip error: {str(e)}")
+    headers = {"Content-Disposition": "attachment; filename=frontend.zip"}
+    return StreamingResponse(io.BytesIO(zip_bytes), media_type="application/zip", headers=headers)
 
 # Export whole project as zip
 @app.get("/export/project.zip")
