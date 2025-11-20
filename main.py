@@ -30,6 +30,7 @@ app.add_middleware(
 
 # Constants from env with sane defaults
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
 TOKEN_TTL_DEFAULT = int(os.getenv("TOKEN_TTL_DEFAULT", "300"))  # seconds
 READ_MAX_BYTES = int(os.getenv("READ_MAX_BYTES", "1048576"))  # 1MB
 RUN_TIMEOUT_MS = int(os.getenv("RUN_TIMEOUT_MS", "8000"))
@@ -388,6 +389,23 @@ def _zip_dir(base_dir: str, out_zip_path: str, arc_base: Optional[str] = None):
                 except Exception:
                     pass
 
+def _zip_dir_into_zipfile(zf, base_dir: str, arc_prefix: str = ""):
+    for dirpath, dirnames, filenames in os.walk(base_dir):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIR_NAMES and not d.startswith('.')]
+        for fname in filenames:
+            if fname == ".DS_Store":
+                continue
+            fpath = os.path.join(dirpath, fname)
+            if "/logs/" in fpath:
+                continue
+            rel = os.path.relpath(fpath, base_dir)
+            arcname = os.path.join(arc_prefix, rel) if arc_prefix else rel
+            try:
+                zf.write(fpath, arcname)
+            except Exception:
+                pass
+
+
 def _zip_dir_to_bytes(base_dir: str, arc_base: Optional[str] = None) -> bytes:
     import zipfile
     buf = io.BytesIO()
@@ -424,46 +442,54 @@ async def export_backend():
 # Export frontend as zip (in-memory to avoid any temp-file edge cases)
 @app.get("/export/frontend.zip")
 async def export_frontend():
-    root = os.path.abspath(os.path.join(os.getcwd(), ".."))
-    frontend_dir = os.path.join(root, "frontend")
-    if not os.path.isdir(frontend_dir):
-        raise HTTPException(status_code=404, detail="frontend directory not found")
+    # In this environment, backend and frontend run in separate services.
+    # This endpoint remains for backward compatibility but will proxy to the frontend service when possible.
+    fe_url = f"{FRONTEND_BASE_URL}/export/frontend.zip"
     try:
-        zip_bytes = _zip_dir_to_bytes(frontend_dir)
+        with requests.get(fe_url, timeout=30, stream=True) as r:
+            if r.status_code != 200:
+                raise HTTPException(status_code=r.status_code, detail=r.text[:200])
+            headers = {"Content-Disposition": "attachment; filename=frontend.zip"}
+            return StreamingResponse(r.iter_content(chunk_size=65536), media_type="application/zip", headers=headers)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"zip error: {str(e)}")
-    headers = {"Content-Disposition": "attachment; filename=frontend.zip"}
-    return StreamingResponse(io.BytesIO(zip_bytes), media_type="application/zip", headers=headers)
+        raise HTTPException(status_code=502, detail=f"frontend proxy error: {str(e)[:200]}")
 
 # Export whole project as zip
 @app.get("/export/project.zip")
 async def export_project():
     import tempfile
-    root = os.path.abspath(os.path.join(os.getcwd(), ".."))
-    if not os.path.isdir(root):
-        raise HTTPException(status_code=404, detail="project root not found")
+    import zipfile
+
+    # Create temp zip file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=",project.zip")
     tmp.close()
-    # create a zip combining backend and frontend preserving folder names
-    import zipfile
+
     with zipfile.ZipFile(tmp.name, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for part in ("backend", "frontend"):
-            part_dir = os.path.join(root, part)
-            if not os.path.isdir(part_dir):
-                continue
-            for dirpath, dirnames, filenames in os.walk(part_dir):
-                dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIR_NAMES and not d.startswith('.')]
-                for fname in filenames:
-                    if fname == ".DS_Store":
-                        continue
-                    fpath = os.path.join(dirpath, fname)
-                    if "/logs/" in fpath:
-                        continue
-                    arcname = os.path.relpath(fpath, root)
-                    try:
-                        zf.write(fpath, arcname)
-                    except Exception:
-                        pass
+        # Add backend files under backend/
+        _zip_dir_into_zipfile(zf, os.getcwd(), arc_prefix="backend")
+
+        # Try to fetch frontend zip and merge under frontend/
+        fe_url = f"{FRONTEND_BASE_URL}/export/frontend.zip"
+        try:
+            with requests.get(fe_url, timeout=60) as r:
+                if r.status_code == 200:
+                    from zipfile import ZipFile
+                    from io import BytesIO
+                    zbytes = BytesIO(r.content)
+                    with ZipFile(zbytes) as fz:
+                        for info in fz.infolist():
+                            if info.is_dir():
+                                continue
+                            # write into combined archive with prefix 'frontend/'
+                            data = fz.read(info.filename)
+                            arcname = os.path.join("frontend", info.filename)
+                            zf.writestr(arcname, data)
+        except Exception:
+            # If frontend unreachable, still return backend-only zip
+            pass
+
     return FileResponse(tmp.name, media_type="application/zip", filename="project.zip")
 
 if __name__ == "__main__":
